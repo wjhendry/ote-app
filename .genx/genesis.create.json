@@ -1,11 +1,11 @@
 {
   "meta": {
     "version": "1.153.1",
-    "generated": "Fri, 22 Nov 2024 08:29:06 GMT"
+    "generated": "Fri, 22 Nov 2024 10:41:47 GMT"
   },
   "data": {
     "projectName": "OTE",
-    "description": "A system with Passive Order Book management and Trade Execution.\nManagement of cash and position movement as orders are placed, including variation margin.\nEnd of day processes for closing prices, and variation margin calls (triggered manually from buttons in front end).",
+    "description": "A system with Passive Order Book management and Trade Execution.\nManagement of cash and position movement as orders are placed, including variation margin.\nEnd of day processes for closing prices, and variation margin calls (triggered manually from buttons in front end).\n\nTo run the system:\n1. Go to static page and add 1 or more currencies\n\n2. Go to User Management and add any further users, and their password to enable multiple participants.  Ensure you select OTE_Admin profile\n\n3. Go to Balances and add cash movements - add TopUp to the participants so they have an active balance\n\n4. a. Go to Instruments\n4. b. Add an Automotive and/or add a Commodity\n4. c. Add an Instrument\n4. d. Add Instrument to Underlying to map to 1 or more underlyings\n\n5. a. Go to Orders and add an order!\n5. b. Adding more orders and different prices / buy vs sell, by differing participants will auto create trades\n\n6. a. Go to Processes\n6. b. \"Run Expiry Process\".   This will set expired trades to Expired (note they are ignored when orders are placed if expired)\n6. c. \"Run Closing Prices\".  This will create a set of average prices over the prior x hours (currently set in the code in the event handler)\n6. d. \"Run Variation Margin Calls\".  This will use the closing prices and trades to make variation margin calls\n\nThe various functions can easily be tailored to meet specific requirements, and these jobs can be set to be triggered by cron rules.",
     "components": [
       "GenesisServerCore",
       "User Authorization",
