@@ -1,7 +1,7 @@
 {
   "meta": {
-    "version": "1.153.1",
-    "generated": "Fri, 22 Nov 2024 10:41:47 GMT"
+    "version": "1.167.6",
+    "generated": "Fri, 10 Jan 2025 10:57:03 GMT"
   },
   "data": {
     "projectName": "OTE",
@@ -14,7 +14,8 @@
       "DataPipelinesCore",
       "Notifications",
       "Reporting",
-      "Document Management"
+      "Document Management",
+      "EventHandlersCore"
     ],
     "tables": [
       {
@@ -1055,6 +1056,226 @@
         }
       }
     ],
+    "eventHandlers": [
+      {
+        "entityName": "INSTRUMENT",
+        "create": {
+          "enabled": true,
+          "metadata": {
+            "comment": "",
+            "todo": "Add these imports to the top of the file:\nimport global.genesis.gen.dao.enums.OTE.cash_movement.Reason\nimport global.genesis.gen.dao.enums.OTE.instrument.Type\nimport global.genesis.gen.dao.enums.OTE.passive_order_book.Side\nimport global.genesis.gen.dao.enums.OTE.passive_order_book.Status\nimport global.genesis.gen.dao.enums.OTE.process_log.Process"
+          }
+        },
+        "update": {
+          "enabled": true
+        },
+        "delete": {
+          "enabled": true
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "PASSIVE_ORDER_BOOK",
+        "create": {
+          "enabled": true,
+          "metadata": {
+            "comment": "This function inserts new orders.  As it does so it:\n1. Cycles through existing orders (of opposite side) where instrument is the same\n2. If order has not already expired (ideally will have moved to \"expired\" state, but chance for race condition)\n3. It then checks whether the price of the open order is favourable\n       if a buy, is sell price offered lower or equal\n       if a sell, is buy price offered higher or equal\n4. If so it hits the order at the open order price, not the new order price\n5. Then adjust the open order to reduce the open position accordingly\n6. Depending on size of new order more than one open order might need to be hit\nThen it proceeds to book trades and make cash movements according to the new trade booked\nFinally it takes an initial margin call on the placed order at any remaining open quantity\n\nNote this uses a \"contextEventHandler\" as this allows the passing of an object between the onValidate and onCommit\nin this case the instrument, thus saving a duplicate database look up",
+            "todo": "Replace the eventHandler with this contextEventHandler:\n    contextEventHandler<PassiveOrderBook, Instrument>(\"PASSIVE_ORDER_BOOK_INSERT\", transactional = true) {\n        permissioning {\n            permissionCodes = listOf(\"PassiveOrderBookUpdate\")\n        }\n        onValidate { event ->\n            val instrument = entityDb.get(Instrument.byId(event.details.instrumentId))\n            require(instrument != null) {\n                \"Instrument ${event.details.instrumentId} does not exist\"\n            }\n            val availableBalance =\n                entityDb.get(CashBalance.byParticipantNameCurrency(event.userName, instrument.currency))?.balance\n            require(\n                (availableBalance ?: 0.0) > (event.details.price * event.details.quantity * instrument.initialMarginPercent)\n            ) { \"Insufficient Balance Available!  You need: ${event.details.price * event.details.quantity * instrument.initialMarginPercent}\" }\n\n            validationAck(validationContext = instrument)\n        }\n        onCommit { event, instrument ->\n            val newOrder = event.details\n            newOrder.openQuantity = newOrder.quantity\n            newOrder.entryDatetime = now()\n            newOrder.participantName = event.userName\n            val reason = if (instrument!!.type == Type.Future) Reason.InitialMargin else Reason.Settlement\n            val currency = instrument.currency\n\n            val tradesToInsert = mutableListOf<Trade>()\n            val cashMovementToInsert = mutableListOf<CashMovement>()\n            val ordersToUpsert = mutableListOf<PassiveOrderBook>()\n\n            if (newOrder.side == Side.Buy) {\n                entityDb.getRange(PassiveOrderBook.byInstrumentIdSide(newOrder.instrumentId, Side.Sell))\n                    .filter { openOrder -> newOrder.price >= openOrder.price && openOrder.status != Status.Filled && openOrder.expiry >= now() }\n                    .toList()\n                    .sortedWith(compareBy({ it.price }, { it.entryDatetime }))\n                    .asSequence()\n                    // Ensure we stop processing items if the order has been filled\n                    .takeWhile { newOrder.status != Status.Filled }\n                    .forEach { openOrder ->\n                        var tradeQuantity: Long = 0\n                        if (openOrder.openQuantity!! >= newOrder.openQuantity!!) {\n                            tradeQuantity = newOrder.openQuantity!!\n                            openOrder.openQuantity = openOrder.openQuantity!! - tradeQuantity\n                            newOrder.openQuantity = 0\n                            newOrder.status = Status.Filled\n                        } else {\n                            tradeQuantity = openOrder.openQuantity!!\n                            newOrder.openQuantity = newOrder.openQuantity!! - tradeQuantity\n                            openOrder.openQuantity = 0\n                            openOrder.status = Status.Filled\n                        }\n                        val initialMargin = tradeQuantity * openOrder.price * instrument.initialMarginPercent\n                        val newTrade = Trade(\n                            buyParticipantName = event.userName,\n                            sellParticipantName = openOrder.participantName!!,\n                            instrumentId = openOrder.instrumentId,\n                            price = openOrder.price,\n                            quantity = tradeQuantity,\n                            tradeDatetime = now(),\n                            initialMargin = initialMargin\n                        )\n                        tradesToInsert.add(newTrade)\n                        //Only need initial margin for the buy - the open order is already taken\n                        val cashMovement = CashMovement(\n                            participantName = newTrade.buyParticipantName,\n                            movementDate = now(),\n                            reason = reason,\n                            currency = currency,\n                            amount = initialMargin * -1.0,\n                        )\n                        cashMovementToInsert.add(cashMovement)\n                        ordersToUpsert.add(openOrder)\n                    }\n            } else {\n                entityDb.getRange(PassiveOrderBook.byInstrumentIdSide(newOrder.instrumentId, Side.Buy))\n                    .filter { openOrder -> newOrder.price <= openOrder.price && openOrder.status != Status.Filled && openOrder.expiry >= now() }\n                    .toList()\n                    .sortedWith(compareByDescending<PassiveOrderBook> { it.price }.thenBy { it.entryDatetime })\n                    .asSequence()\n                    // Ensure we stop processing items if the order has been filled\n                    .takeWhile { newOrder.status != Status.Filled }\n                    .forEach { openOrder ->\n                        var tradeQuantity: Long = 0\n                        if (openOrder.openQuantity!! >= newOrder.openQuantity!!) {\n                            tradeQuantity = newOrder.openQuantity!!\n                            openOrder.openQuantity = openOrder.openQuantity!! - tradeQuantity\n                            newOrder.openQuantity = 0\n                            newOrder.status = Status.Filled\n                        } else {\n                            tradeQuantity = openOrder.openQuantity!!\n                            newOrder.openQuantity = newOrder.openQuantity!! - tradeQuantity\n                            openOrder.openQuantity = 0\n                            openOrder.status = Status.Filled\n                        }\n                        val initialMargin = tradeQuantity * openOrder.price * instrument.initialMarginPercent\n                        val newTrade = Trade(\n                            buyParticipantName = openOrder.participantName!!,\n                            sellParticipantName = event.userName,\n                            instrumentId = openOrder.instrumentId,\n                            price = openOrder.price,\n                            quantity = tradeQuantity,\n                            tradeDatetime = now(),\n                            initialMargin = initialMargin\n                        )\n                        tradesToInsert.add(newTrade)\n                        //Only need initial margin for the sell - the open order is already taken\n                        val cashMovement = CashMovement(\n                            participantName = newTrade.sellParticipantName,\n                            movementDate = now(),\n                            reason = reason,\n                            currency = currency,\n                            amount = initialMargin\n                        )\n                        cashMovementToInsert.add(cashMovement)\n                        ordersToUpsert.add(openOrder)\n                    }\n            }\n            // Add new order to list of orders to update.\n            ordersToUpsert.add(newOrder)\n            // Perform order changes\n            val ordersUpsertResult = entityDb.upsertAll(ordersToUpsert.map { EntityModifyDetails(it) })\n            // Retrieve newOrder orderId\n            val newOrderId = ordersUpsertResult.last().record.orderId\n            // Insert trades\n            val tradesInsertResult = entityDb.insertAll(tradesToInsert)\n            // Update cash movements with trade ids\n            tradesInsertResult.forEachIndexed { index, insertResult ->\n                cashMovementToInsert[index].tradeId = insertResult.record.tradeId\n            }\n            //Now take an initial marking for the remaining portion of the new order\n            if ((newOrder.openQuantity ?: 0) > 0) {\n                val initialMargin = newOrder.openQuantity!! * newOrder.price * instrument.initialMarginPercent\n                // Set last order id in a new cashMovement record if needed.\n                cashMovementToInsert.add(\n                    CashMovement(\n                        participantName = event.userName,\n                        movementDate = now(),\n                        reason = reason,\n                        currency = currency,\n                        amount = initialMargin,\n                        orderId = newOrderId\n                    )\n                )\n            }\n            // Insert all cash movements in one go\n            entityDb.insertAll(cashMovementToInsert)\n\n            // return an ack response which contains a list of record IDs\n            ack(\n                listOf(\n                    mapOf(\n                        \"ORDER_ID\" to newOrderId,\n                    )\n                )\n            )\n        }\n    }\n\n"
+          }
+        },
+        "update": {
+          "enabled": false
+        },
+        "delete": {
+          "enabled": true,
+          "metadata": {
+            "comment": "The below allows the withdrawal of an order, but only by the person who submitted it.  It also reverses any remaining initial margin movement\nNote this uses a \"contextEventHandler\" as this allows the passing of an object between the onValidate and onCommit in this case the instrument, thus saving a duplicate database look up\n",
+            "todo": "Replace the eventHandler with this contextEventHandler:\n    contextEventHandler<PassiveOrderBook, Instrument>(\"PASSIVE_ORDER_BOOK_DELETE\", transactional = true) {\n        permissioning {\n            permissionCodes = listOf(\"PassiveOrderBookUpdate\")\n        }\n        onValidate { event ->\n            require(event.userName == event.details.participantName) {\n                  \"You are only able to withdraw your own orders!\" }\n            require(event.details.status == Status.Active) { \"This order is not active!\" }\n\n            val instrument = entityDb.get(Instrument.byId(event.details.instrumentId))\n            require(instrument != null) { \"Instrument ${event.details.instrumentId} does not exist\" }\n\n            validationAck(validationContext = instrument)\n        }\n        onCommit { event, instrument ->\n            val details = event.details\n\n            //Set trade to withdrawn & increment version number\n            details.status = Status.Withdrawn\n            details.version = details.version + 1\n            entityDb.modify(details)\n\n            //Move initial margin back with a cash movement\n            entityDb.insert(\n                CashMovement(\n                    participantName = event.userName, //Already checked it is the same\n                    movementDate = now(),\n                    reason = Reason.InitialMargin,\n                    currency = instrument!!.currency,\n                    amount = (details.openQuantity?:0.0).toDouble() * details.price * instrument.initialMarginPercent * (if (details.side == Side.Sell) -1 else 1),\n                    orderId = details.orderId\n                )\n            )\n\n            ack()\n        }\n    }\n"
+          }
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "TRADE",
+        "create": {
+          "enabled": false
+        },
+        "update": {
+          "enabled": false
+        },
+        "delete": {
+          "enabled": false
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "CLOSING_PRICE",
+        "create": {
+          "enabled": false
+        },
+        "update": {
+          "enabled": false
+        },
+        "delete": {
+          "enabled": false
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "CASH_BALANCE",
+        "create": {
+          "enabled": false
+        },
+        "update": {
+          "enabled": false
+        },
+        "delete": {
+          "enabled": false
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "CASH_MOVEMENT",
+        "create": {
+          "enabled": true
+        },
+        "update": {
+          "enabled": true
+        },
+        "delete": {
+          "enabled": true
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "OPEN_POSITION",
+        "create": {
+          "enabled": false
+        },
+        "update": {
+          "enabled": false
+        },
+        "delete": {
+          "enabled": false
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "INSTRUMENT_TO_UNDERLYING",
+        "create": {
+          "enabled": true
+        },
+        "update": {
+          "enabled": true
+        },
+        "delete": {
+          "enabled": true
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "COMMODITY",
+        "create": {
+          "enabled": true
+        },
+        "update": {
+          "enabled": true
+        },
+        "delete": {
+          "enabled": true
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "AUTOMOTIVE",
+        "create": {
+          "enabled": true
+        },
+        "update": {
+          "enabled": true
+        },
+        "delete": {
+          "enabled": true
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "PROCESS_LOG",
+        "create": {
+          "enabled": false
+        },
+        "update": {
+          "enabled": false
+        },
+        "delete": {
+          "enabled": false
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "CURRENCY_CODES",
+        "create": {
+          "enabled": true
+        },
+        "update": {
+          "enabled": true
+        },
+        "delete": {
+          "enabled": true
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "PARTICIPANT_POSITION",
+        "create": {
+          "enabled": false
+        },
+        "update": {
+          "enabled": false
+        },
+        "delete": {
+          "enabled": false
+        },
+        "type": "crud"
+      },
+      {
+        "entityName": "CLOSING_POSITION",
+        "create": {
+          "enabled": false
+        },
+        "update": {
+          "enabled": false
+        },
+        "delete": {
+          "enabled": false
+        },
+        "type": "crud"
+      },
+      {
+        "name": "RUN_CLOSING_PRICES",
+        "type": "custom",
+        "metadata": {
+          "comment": "This event runs a closing price process that calculates a weighted average price from the trades booked in a given time period prior to the process.\nThere could be a number of ways of doing this depending on the requirements of the end user\n",
+          "todo": "Add this code after \"onCommit\" row\n            val priceCheckStartHour = now().hourOfDay - 1\n            val priceCheckEndHour = now().hourOfDay + 1\n            LOG.info(\"Closing prices will be calculated form trades between the hours: $priceCheckStartHour and $priceCheckEndHour\")\n\n            //Get all instruments\n            entityDb.getBulk(INSTRUMENT).toList().forEach {\n                val trades = entityDb.getRange(Trade.byInstrumentIdTradeDatetime(it.instrumentId, now().withTimeAtStartOfDay().plusHours(priceCheckStartHour)),Trade.byInstrumentIdTradeDatetime(it.instrumentId, now().withTimeAtStartOfDay().plusHours(priceCheckEndHour)))\n                    .toList()\n                var weightedPrice = 0.0\n                var quantity = 0.0\n                //Look for trades against the instrument\n                trades.forEach {\n                    weightedPrice += it.price * it.quantity\n                    quantity += it.quantity\n                }\n                //Using upsert so a rerun updates and replaces existing prices\n                entityDb.upsert(\n                    ClosingPrice (\n                        closingDate = now().withTimeAtStartOfDay(),\n                        instrumentId = it.instrumentId,\n                        price = weightedPrice / quantity\n                    )\n                )\n            }\n\n            //Log the process has run\n            entityDb.insert(\n                ProcessLog(\n                    process = Process.ClosingPrices,\n                    ranAt = now()\n                )\n            )\n            LOG.info(\"Have run closing prices\")"
+        }
+      },
+      {
+        "name": "RUN_VARIATION_MARGIN",
+        "type": "custom",
+        "metadata": {
+          "comment": "This process takes the most recent closing prices and triggers cash movements to reflect a variation margin based upon the movement seen in the market.  This assumes a 100% variation call after a closing price is run.  This is only done for Type == Future.  This function could vary by end user requirement",
+          "todo": "Add this prior to \"onCommit\" row:\n        onValidate { event ->\n            val lastClosingPriceRun = entityDb.getBulk(CLOSING_PRICE)\n            require(lastClosingPriceRun.count() != 0) {\"No closing prices - run closing prices first!\"}\n            ack()\n        }\n\nTODO: Add this after the \"onCommit\" row:\n            //Get last closing position run datetime\n            val lastEntry = entityDb.getBulk(CLOSING_POSITION).toList().maxByOrNull { it.ranAt }\n            var lastRun = DateTime.parse(\"2000-01-01\")\n            if (lastEntry != null) {\n                lastRun = lastEntry.ranAt\n            }\n            val runUntil = now()\n            LOG.info(\"Running variation margin calls between $lastRun and $runUntil\")\n\n            //Get last closing price run time\n            var lastClosingPriceRun = entityDb.getBulk(CLOSING_PRICE).toList().maxByOrNull { it.closingDate }\n            var lastClosingPriceDate = DateTime.parse(\"2000-01-01\")\n            if (lastClosingPriceRun != null) {\n                lastClosingPriceDate = lastClosingPriceRun.closingDate\n            }\n            //Get last closing prices\n            val closingPriceMap = mutableMapOf<Long, Double>()\n            entityDb.getRange(ClosingPrice.byClosingDate(lastClosingPriceDate))\n                .toList()\n                .forEach {\n                    closingPriceMap[it.instrumentId] = it.price\n                }\n            //Get instrument currencies\n            val instrumentCurrency = mutableMapOf<Long, String>()\n            entityDb.getBulk(INSTRUMENT)\n                .toList()\n                .forEach {\n                    instrumentCurrency[it.instrumentId] = it.currency\n                }\n            //Get instrument types\n            val instrumentType = mutableMapOf<Long, Type>()\n            entityDb.getBulk(INSTRUMENT)\n                .toList()\n                .forEach {\n                    instrumentType[it.instrumentId] = it.type\n                }\n\n            //Create map of new closing positions\n            var participantInstrumentMap = mutableMapOf<String, ClosingPosition> ()\n            //.Add trade data\n            entityDb.getRange(Trade.byTradeDatetime(lastRun), Trade.byTradeDatetime(runUntil))\n                .toList()\n                .filter { instrumentType[it.instrumentId] == Type.Future }\n                .forEach {\n                    //Buy side\n                    var key = it.buyParticipantName + \"|\" + it.instrumentId\n                    val closingPrice = closingPriceMap[it.instrumentId]?: 0.0\n                    val priceMove = closingPrice - it.price\n                    if (participantInstrumentMap.containsKey(key) == false) {\n                        participantInstrumentMap[key] = ClosingPosition(\n                            closingDate = runUntil,\n                            ranAt = runUntil,\n                            participantName = it.buyParticipantName,\n                            instrumentId = it.instrumentId,\n                            quantity = it.quantity,\n                            price = closingPrice,\n                        )\n                    }\n                    else{\n                        participantInstrumentMap[key]!!.quantity += it.quantity\n                    }\n                    //Do variation margin movement\n                    var movement = it.quantity * priceMove * -1\n                    if(movement != 0.0) {\n                        entityDb.insert(\n                            CashMovement(\n                                amount = movement,\n                                currency = instrumentCurrency[it.instrumentId]!!,\n                                movementDate = now(),\n                                participantName = it.buyParticipantName,\n                                reason = Reason.VariationMargin,\n                                tradeId = it.tradeId\n                            )\n                        )\n                    }\n                    //Sell side\n                    key = it.sellParticipantName + \"|\" + it.instrumentId\n                    if (participantInstrumentMap.containsKey(key) == false) {\n                        participantInstrumentMap[key] = ClosingPosition(\n                            closingDate = runUntil,\n                            ranAt = runUntil,\n                            participantName = it.sellParticipantName,\n                            instrumentId = it.instrumentId,\n                            quantity = it.quantity * -1,\n                            price = closingPrice,\n                        )\n                    }\n                    else{\n                        participantInstrumentMap[key]!!.quantity -= it.quantity\n                    }\n                    //Do variation margin movement\n                    movement = it.quantity * priceMove\n                    if(movement != 0.0) {\n                        entityDb.insert(\n                            CashMovement(\n                                amount = movement,\n                                currency = instrumentCurrency[it.instrumentId]!!,\n                                movementDate = now(),\n                                participantName = it.sellParticipantName,\n                                reason = Reason.VariationMargin,\n                                tradeId = it.tradeId\n                            )\n                        )\n                    }\n                }\n            //Add prior closing data\n            entityDb.getRange(ClosingPosition.byRanAt(lastRun))\n                .toList()\n                .filter { instrumentType[it.instrumentId] == Type.Future }\n                .forEach {\n                    var key = it.participantName + \"|\" + it.instrumentId\n                    val closingPrice = closingPriceMap[it.instrumentId] ?: 0.0\n                    val priceMove = closingPrice - it.price\n                    if (participantInstrumentMap.containsKey(key) == false) {\n                        participantInstrumentMap[key] = ClosingPosition(\n                            closingDate = runUntil,\n                            ranAt = runUntil,\n                            participantName = it.participantName,\n                            instrumentId = it.instrumentId,\n                            quantity = it.quantity,\n                            price = closingPrice,\n                        )\n                    } else {\n                        participantInstrumentMap[key]!!.quantity += it.quantity\n                    }\n                    //Do variation margin movement\n                    val movement = it.quantity * priceMove\n                    if(movement != 0.0) {\n                        entityDb.insert(\n                            CashMovement(\n                                amount = movement,\n                                currency = instrumentCurrency[it.instrumentId]!!,\n                                movementDate = now(),\n                                participantName = it.participantName,\n                                reason = Reason.VariationMargin\n                            )\n                        )\n                    }\n                }\n\n            //Save CLosingPosition where quantity is non-zero\n            participantInstrumentMap.forEach {\n                if(it.value.quantity != 0.toLong()) {\n                    entityDb.insert(it.value)\n                }\n            }\n\n            //Log the process has run\n            entityDb.insert(\n                ProcessLog(\n                    process = Process.VariationMargin,\n                    ranAt = runUntil\n                )\n            )\n            LOG.info(\"Have run variation margin calls\")\n"
+        }
+      },
+      {
+        "name": "EXPIRE_ORDERS",
+        "type": "custom",
+        "metadata": {
+          "comment": "This event runs a process to expire any orders where the expiry date is prior to now In the order insert, this is checked again anyway, but in production this process should run on a sensible schedule to ensure orders expire in a timely fashion\nCurrently called from a front end button, but could easily be a CRON_RULE triggering this\n",
+          "todo": "Add this after the \"onCommit\" row:\n            entityDb.getRange(PassiveOrderBook.byExpiry(DateTime.parse(\"2000-01-01\")), PassiveOrderBook.byExpiry(now()))\n                .toList().filter { it.status == Status.Active }.forEach {\n                    it.status = Status.Expired\n                    entityDb.modify(it)\n                    //Move initial margin back with a cash movement\n                    val instrument = entityDb.get(Instrument.byId(it.instrumentId))\n                    entityDb.insert(\n                        CashMovement(\n                            participantName = it.participantName!!,\n                            movementDate = now(),\n                            reason = Reason.InitialMargin,\n                            currency = instrument!!.currency,\n                            amount = (it.openQuantity?:0.0).toDouble() * it.price * instrument.initialMarginPercent * (if (it.side == Side.Sell) -1 else 1),\n                            orderId = it.orderId\n                        )\n                    )\n                }\n            //Log the process has run\n            entityDb.insert(\n                ProcessLog(\n                    process = Process.OrderExpiry,\n                    ranAt = now()\n                )\n            )\n            LOG.info(\"Have run expiry process\")\n"
+        }
+      }
+    ],
     "consolidators": [
       {
         "name": "OPEN_POSITION_AGG",
@@ -1272,6 +1493,7 @@
                 "updateEvent": null,
                 "deleteEvent": "EVENT_PASSIVE_ORDER_BOOK_DELETE",
                 "createEvent": "EVENT_PASSIVE_ORDER_BOOK_INSERT",
+                "customEvents": null,
                 "modalPosition": "centre",
                 "sizeColumnsToFit": true,
                 "enableSearchBar": true,
@@ -2829,6 +3051,7 @@
                 "updateEvent": "EVENT_INSTRUMENT_MODIFY",
                 "deleteEvent": "EVENT_INSTRUMENT_DELETE",
                 "createEvent": "EVENT_INSTRUMENT_INSERT",
+                "customEvents": null,
                 "modalPosition": "centre",
                 "sizeColumnsToFit": true,
                 "enableSearchBar": true,
@@ -3280,6 +3503,7 @@
                 "updateEvent": "EVENT_INSTRUMENT_TO_UNDERLYING_MODIFY",
                 "deleteEvent": "EVENT_INSTRUMENT_TO_UNDERLYING_DELETE",
                 "createEvent": "EVENT_INSTRUMENT_TO_UNDERLYING_INSERT",
+                "customEvents": null,
                 "modalPosition": "centre",
                 "sizeColumnsToFit": true,
                 "enableSearchBar": true,
@@ -3494,6 +3718,7 @@
                 "updateEvent": "EVENT_AUTOMOTIVE_MODIFY",
                 "deleteEvent": "EVENT_AUTOMOTIVE_DELETE",
                 "createEvent": "EVENT_AUTOMOTIVE_INSERT",
+                "customEvents": null,
                 "modalPosition": "centre",
                 "sizeColumnsToFit": true,
                 "enableSearchBar": true,
@@ -3745,6 +3970,7 @@
                 "updateEvent": "EVENT_COMMODITY_MODIFY",
                 "deleteEvent": "EVENT_COMMODITY_DELETE",
                 "createEvent": "EVENT_COMMODITY_INSERT",
+                "customEvents": null,
                 "modalPosition": "centre",
                 "sizeColumnsToFit": true,
                 "enableSearchBar": true,
@@ -4003,9 +4229,10 @@
                   "updateRight": "ClosingPriceUpdate",
                   "viewRight": "ClosingPriceView"
                 },
-                "updateEvent": "EVENT_CLOSING_PRICE_MODIFY",
-                "deleteEvent": "EVENT_CLOSING_PRICE_DELETE",
-                "createEvent": "EVENT_CLOSING_PRICE_INSERT",
+                "updateEvent": null,
+                "deleteEvent": null,
+                "createEvent": null,
+                "customEvents": null,
                 "modalPosition": "centre",
                 "sizeColumnsToFit": true,
                 "enableSearchBar": true,
@@ -4889,6 +5116,7 @@
                 "updateEvent": "EVENT_CASH_MOVEMENT_MODIFY",
                 "deleteEvent": "EVENT_CASH_MOVEMENT_DELETE",
                 "createEvent": "EVENT_CASH_MOVEMENT_INSERT",
+                "customEvents": null,
                 "modalPosition": "centre",
                 "sizeColumnsToFit": true,
                 "enableSearchBar": true,
@@ -5515,7 +5743,8 @@
                 },
                 "updateEvent": null,
                 "deleteEvent": null,
-                "createEvent": "EVENT_PROCESS_LOG_INSERT",
+                "createEvent": null,
+                "customEvents": null,
                 "modalPosition": "centre",
                 "sizeColumnsToFit": true,
                 "enableSearchBar": true,
@@ -5732,7 +5961,10 @@
                   ]
                 }
               },
-              "meta": {}
+              "meta": {},
+              "metadata": {
+                "todo": "Add this after the \"@Connect connect: Connect;\" row:\n  runExpiryProcess() {\n    this.connect.commitEvent(\"EVENT_EXPIRE_ORDERS\", {DETAILS:{}})\n  }\n\n  runClosingPrices() {\n    this.connect.commitEvent(\"EVENT_RUN_CLOSING_PRICES\", {DETAILS:{}})\n  }\n\n  runVariationMargin() {\n    this.connect.commitEvent(\"EVENT_RUN_VARIATION_MARGIN\", {DETAILS:{}})\n  }\n\n\nTODO: Inside \"process-history.template.ts\" replace the row \"></entity-management>\" with: \n  crud-menu-position=\"top\"\n>\n  <rapid-button slot=\"crud-top-before\" @click=${x => x.runExpiryProcess()}>Run Expiry Process</rapid-button>\n  <rapid-button slot=\"crud-top-before\" @click=${x => x.runClosingPrices()}>Run Closing Prices</rapid-button>\n  <rapid-button slot=\"crud-top-before\" @click=${x => x.runVariationMargin()}>Run Variation Margin Calls</rapid-button>\n</entity-management>\n"
+              }
             }
           ]
         },
@@ -5756,6 +5988,7 @@
                 "updateEvent": "EVENT_CURRENCY_CODES_MODIFY",
                 "deleteEvent": "EVENT_CURRENCY_CODES_DELETE",
                 "createEvent": "EVENT_CURRENCY_CODES_INSERT",
+                "customEvents": null,
                 "modalPosition": "centre",
                 "sizeColumnsToFit": true,
                 "enableSearchBar": true,
